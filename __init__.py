@@ -151,6 +151,10 @@ NODE_DISPLAY_NAME_MAPPINGS.update(RUNTIME_NODE_DISPLAY_NAME_MAPPINGS)
 
 WEB_DIRECTORY = "./web"
 
+# Server-side file browser for path-based nodes (fork addition). Guarded inside
+# the module itself so a failure there can never prevent the pack from loading.
+from . import server_browser  # noqa: E402,F401
+
 # Export so that ComfyUI can pick them up.
 __all__ = [
     "NODE_CLASS_MAPPINGS",
