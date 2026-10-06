@@ -38,8 +38,22 @@ _BT2020_RGB_TO_YUV = torch.tensor(
 )
 
 
+# Frame-number token in a sequence pattern, Nuke-style: ``####`` (one digit per
+# ``#``) or printf-style ``%04d`` / ``%d``. Only the file name may hold it.
+_SEQ_TOKEN_RE = re.compile(r"#+|%0?(\d*)d")
+# A numbered frame: prefix, frame number (last digit run) and the .exr suffix.
+_FRAME_RE = re.compile(r"^(.*?)(\d+)(\.exr)$", re.IGNORECASE)
+
+
+def _is_sequence_pattern(path: str | Path) -> bool:
+    return bool(_SEQ_TOKEN_RE.search(Path(path).name))
+
+
 def _resolve_path(path: str) -> Path:
     p = Path(path).expanduser()
+    if _is_sequence_pattern(p):
+        # A pattern is not a real file: resolve its folder and keep the pattern name.
+        return _resolve_path(str(p.parent)) / p.name
     if p.is_absolute() and p.exists():
         return p
     # Prefer Comfy input dir for relative paths.
@@ -65,8 +79,57 @@ def _natural_sort_key(name: str) -> tuple:
     return tuple(key)
 
 
+def _pattern_regex(name: str) -> re.Pattern:
+    """Regex for a pattern file name such as ``shot.####.exr`` or ``shot.%04d.exr``."""
+    m = list(_SEQ_TOKEN_RE.finditer(name))[-1]
+    token = m.group(0)
+    width = len(token) if token.startswith("#") else int(m.group(1) or 0)
+    digits = rf"\d{{{width},}}" if width > 1 else r"\d+"
+    return re.compile(
+        "^" + re.escape(name[: m.start()]) + f"({digits})" + re.escape(name[m.end():]) + "$",
+        re.IGNORECASE,
+    )
+
+
+def _sequence_groups(files: list[Path]) -> dict[str, list[Path]]:
+    """Group EXR files by sequence, keyed by a ``prefix####suffix`` pattern name.
+
+    Un-numbered files are their own group (a still).
+    """
+    groups: dict[str, list[Path]] = {}
+    for f in files:
+        m = _FRAME_RE.match(f.name)
+        key = m.group(1) + "#" * len(m.group(2)) + m.group(3) if m else f.name
+        groups.setdefault(key, []).append(f)
+    return groups
+
+
+def _describe_group(key: str, files: list[Path]) -> str:
+    if len(files) == 1:
+        return f"{files[0].name} (single frame)"
+    nums = sorted(int(_FRAME_RE.match(f.name).group(2)) for f in files)
+    return f"{key}: {len(files)} frames ({nums[0]}-{nums[-1]})"
+
+
 def _list_exr_files(path: Path) -> list[Path]:
-    """Resolve a still ``.exr`` or an EXR folder to a sorted frame list."""
+    """Resolve a still ``.exr``, a sequence pattern or an EXR folder to a frame list.
+
+    A folder must hold a single sequence. A folder with several sequences (e.g. a
+    proxy and a 2K version side by side) is rejected with the list of sequences
+    found, so the user can pick one by pattern instead of loading them mixed.
+    """
+    if _is_sequence_pattern(path):
+        folder = path.parent
+        if not folder.is_dir():
+            raise FileNotFoundError(f"HDR sequence folder not found: {folder}")
+        rx = _pattern_regex(path.name)
+        files = sorted(
+            (p for p in folder.iterdir() if p.is_file() and rx.match(p.name)),
+            key=lambda p: _natural_sort_key(p.name),
+        )
+        if not files:
+            raise RuntimeError(f"No .exr frames match {path.name} in {folder}")
+        return files
     if path.is_file():
         if path.suffix.lower() != ".exr":
             raise ValueError(f"Expected a .exr file; got {path}")
@@ -79,8 +142,22 @@ def _list_exr_files(path: Path) -> list[Path]:
         )
         if not files:
             raise RuntimeError(f"No .exr frames in {path}")
+        groups = _sequence_groups(files)
+        if len(groups) > 1:
+            listing = "\n".join(
+                "  - " + _describe_group(k, v)
+                for k, v in sorted(groups.items(), key=lambda kv: _natural_sort_key(kv[0]))
+            )
+            example = next((k for k, v in groups.items() if len(v) > 1), next(iter(groups)))
+            raise ValueError(
+                f"{path} contains {len(groups)} EXR sequences/stills; load one at a time.\n"
+                f"Pick a frame with 📁 Browse… or set path to a pattern, e.g. "
+                f"{path / example}\n{listing}"
+            )
         return files
-    raise ValueError(f"Path must be a .exr file or a directory of EXRs; got {path}")
+    raise ValueError(
+        f"Path must be a .exr file, a sequence pattern (####, %04d) or a directory of EXRs; got {path}"
+    )
 
 
 def _silent_audio(num_frames: int, frame_rate: float, sample_rate: int = 44100) -> dict:

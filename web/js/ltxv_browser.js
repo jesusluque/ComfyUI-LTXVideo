@@ -5,10 +5,11 @@
 // SERVER (e.g. a shared filespace under /mnt) through GET /ltxv/browse, so users
 // don't have to type absolute paths.
 //
-// The node accepts either a single .exr still or a FOLDER of frames:
-//   - picking a frame that belongs to a sequence fills the FOLDER (whole sequence);
+// The node accepts a single .exr still, a sequence PATTERN or a FOLDER of frames:
+//   - picking a frame that belongs to a sequence fills its pattern, Nuke-style
+//     (dir/shot.####.exr), so folders holding several sequences (proxy + 2K…) work;
 //   - picking a lone .exr fills that file;
-//   - "📂 Use folder" fills the current folder.
+//   - "📂 Use folder" fills the current folder, only if it holds a single sequence.
 // Read-only info rows on the node show the frame count, the frame range and what
 // trim_to_8k1 will keep (V2V needs 8k+1 frames). They are not serialized.
 import { app } from "../../../scripts/app.js";
@@ -19,36 +20,38 @@ const EXTS = "exr";
 const BTN = "📁 Browse…";
 const DEFAULT_START = "/mnt/s3files";
 
-function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 
-// Frames of the sequence a file belongs to (same prefix/suffix, variable number).
-function seqOf(filename, files) {
-  const m = filename.match(/^(.*?)(\d+)(\.[^.]+)$/);
-  if (!m) return null;
-  const [, prefix, , ext] = m;
-  const re = new RegExp("^" + escRe(prefix) + "(\\d+)" + escRe(ext) + "$");
-  const nums = [];
-  for (const f of files || []) { const mm = f.match(re); if (mm) nums.push(parseInt(mm[1], 10)); }
-  if (nums.length < 2) return null;
-  nums.sort((a, b) => a - b);
-  return { start: nums[0], end: nums[nums.length - 1], count: nums.length };
-}
-
-// Dominant sequence of a folder (largest group of numbered .exr files).
-function seqOfFolder(files) {
+// Same grouping as the server (hdr_io._sequence_groups): numbered frames are keyed
+// by a "prefix####suffix" pattern; un-numbered files are their own group (a still).
+const FRAME_RE = /^(.*?)(\d+)(\.exr)$/i;
+function groupsOf(files) {
   const groups = {};
   for (const f of files || []) {
-    const m = f.match(/^(.*?)(\d+)(\.[^.]+)$/);
-    if (!m) continue;
-    const key = m[1] + "|" + m[2].length + "|" + m[3];
-    (groups[key] = groups[key] || []).push(parseInt(m[2], 10));
+    const m = f.match(FRAME_RE);
+    const key = m ? m[1] + "#".repeat(m[2].length) + m[3] : f;
+    (groups[key] = groups[key] || []).push(m ? parseInt(m[2], 10) : null);
   }
-  let best = null;
-  for (const k in groups) if (!best || groups[k].length > best.length) best = groups[k];
-  if (!best || !best.length) return null;
-  best.sort((a, b) => a - b);
-  return { start: best[0], end: best[best.length - 1], count: best.length };
+  return groups;
 }
+function seqInfo(nums) {
+  if (!nums || nums.length < 2) return null;
+  const s = [...nums].sort((a, b) => a - b);
+  return { start: s[0], end: s[s.length - 1], count: s.length };
+}
+// Sequence (pattern + info) a picked frame belongs to; null for a lone still.
+function seqOf(filename, files) {
+  const m = filename.match(FRAME_RE);
+  if (!m) return null;
+  const pattern = m[1] + "#".repeat(m[2].length) + m[3];
+  const info = seqInfo(groupsOf(files)[pattern]);
+  return info ? { pattern, ...info } : null;
+}
+// The single sequence of a folder, or null if it holds none or several.
+function seqOfFolder(files) {
+  const keys = Object.keys(groupsOf(files));
+  return keys.length === 1 ? seqInfo(groupsOf(files)[keys[0]]) : null;
+}
+function isPattern(v) { return /#+|%0?\d*d/.test(String(v).split("/").pop() || ""); }
 
 // Largest n <= count with n = 8k+1 (what trim_to_8k1 keeps).
 function trim8k1(count) { return count < 1 ? 0 : count - ((count - 1) % 8); }
@@ -100,7 +103,15 @@ function openBrowser(startPath, onPick) {
     btn("⬆", () => { if (parent) nav(parent); }),
     pathInput,
     btn("Go", () => nav(pathInput.value)),
-    btn("📂 Use folder", () => { onPick(cur, { isFile: false, dir: cur, files: curFiles }); close(); }),
+    btn("📂 Use folder", () => {
+      const n = Object.keys(groupsOf(curFiles)).length;
+      if (n > 1) {
+        status.style.color = "#e6a23c";
+        status.textContent = `This folder holds ${n} sequences/stills: pick a frame of the one you want.`;
+        return;
+      }
+      onPick(cur, { isFile: false, dir: cur, files: curFiles }); close();
+    }),
     btn("✕", close),
   );
   pathInput.addEventListener("keydown", (e) => { if (e.key === "Enter") nav(pathInput.value); });
@@ -132,8 +143,13 @@ function openBrowser(startPath, onPick) {
       onPick(joinPath(cur, f), { isFile: true, dir: cur, file: f, files: curFiles }); close();
     })));
     if (!(j.dirs || []).length && !curFiles.length) list.append(row("·", "(no folders or .exr files)", () => {}));
+    const groups = groupsOf(curFiles);
+    const n = Object.keys(groups).length;
     const seq = seqOfFolder(curFiles);
-    status.textContent = seq ? `${seq.count} .exr frames here (${seq.start}–${seq.end})` : `${curFiles.length} .exr files`;
+    status.style.color = "#999";
+    status.textContent = seq ? `${seq.count} .exr frames here (${seq.start}–${seq.end})`
+      : n > 1 ? `${n} sequences/stills here — pick a frame to load just its sequence`
+      : `${curFiles.length} .exr files`;
   }
   nav(startPath);
 }
@@ -177,12 +193,12 @@ function showInfo(node, seq, single) {
 function attach(node, widgetName) {
   const w = getW(node, widgetName);
   const v = w && w.value ? String(w.value) : "";
-  const start = v.startsWith("/") ? (v.toLowerCase().endsWith(".exr") ? dirname(v) : v) : DEFAULT_START;
+  const start = v.startsWith("/") ? (v.toLowerCase().endsWith(".exr") || isPattern(v) ? dirname(v) : v) : DEFAULT_START;
   openBrowser(start, (picked, info) => {
     let value = picked;
     if (info.isFile) {
       const seq = seqOf(info.file, info.files);
-      if (seq) { value = info.dir; showInfo(node, seq, false); }   // whole sequence
+      if (seq) { value = joinPath(info.dir, seq.pattern); showInfo(node, seq, false); }   // whole sequence, by pattern
       else { showInfo(node, null, true); }                           // lone still
     } else {
       showInfo(node, seqOfFolder(info.files), false);
@@ -208,7 +224,9 @@ app.registerExtension({
     nodeType.prototype.onNodeCreated = function () {
       const r = onCreated ? onCreated.apply(this, arguments) : undefined;
       if (!this.widgets?.some((w) => w.name === BTN)) {
-        this.addWidget("button", BTN, null, () => attach(this, widgetName));
+        // serialize:false — a button is not an input; otherwise it lands in the prompt.
+        const b = this.addWidget("button", BTN, null, () => attach(this, widgetName), { serialize: false });
+        if (b) b.serialize = false;
       }
       return r;
     };

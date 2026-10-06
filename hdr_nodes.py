@@ -411,8 +411,9 @@ class LTXVLoadEXRSequence:
                     {
                         "default": "",
                         "tooltip": (
-                            "Path to a .exr still or a directory of *.exr frames. "
-                            "I2V: single still is fine. V2V: use a folder with 8k+1 frames. "
+                            "Path to a .exr still, a sequence pattern (shot.####.exr or "
+                            "shot.%04d.exr) or a directory holding a single *.exr sequence. "
+                            "I2V: single still is fine. V2V: use a sequence with 8k+1 frames. "
                             "Relative paths are resolved under ComfyUI's input folder."
                         ),
                     },
